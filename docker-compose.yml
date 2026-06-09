@@ -1,0 +1,141 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.1-python3.10
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://platform_admin:supersecretpassword@postgres:5432/airflow_metadata
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./for_load:/opt/airflow/data
+    - .:/opt/airflow/dbt_project
+  networks:
+    - data_network
+
+services:
+  # --- ХРАНИЛИЩЕ ДАННЫХ ---
+  clickhouse-course1:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_USER: student
+      CLICKHOUSE_PASSWORD: strongpassword
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      TZ: UTC
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    networks:
+      - data_network
+
+  # --- ТРАНСФОРМАЦИЯ ДАННЫХ (ЛОКАЛЬНЫЙ РАННЕР) ---
+  dbt:
+    build:
+      context: . 
+    container_name: dbt_runner
+    environment:
+      - DBT_PROFILES_DIR=/usr/app
+    volumes:
+      - .:/usr/app
+    networks:
+      - data_network
+    depends_on:
+      - clickhouse-course1
+
+  # --- БАЗА ДАННЫХ ДЛЯ МЕТАДАННЫХ (AIRFLOW) ---
+  postgres:
+    image: postgres:15-alpine
+    container_name: platform_metadata_db
+    environment:
+      POSTGRES_USER: platform_admin
+      POSTGRES_PASSWORD: supersecretpassword
+      POSTGRES_DB: airflow_metadata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - data_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platform_admin -d airflow_metadata"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- ОРКЕСТРАТОР AIRFLOW ---
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow_init
+    entrypoint: /bin/bash
+    command: -c "airflow db init && airflow users create --username admin --firstname Admin --lastname Admin --role Admin --email admin@example.com --password admin"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data_network
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data_network
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow_scheduler
+    command: scheduler
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data_network
+
+  # --- БИЗНЕС-АНАЛИТИКА SUPERSET (ТОТ САМЫЙ РАБОЧИЙ ВАРИАНТ) ---
+  superset:
+    image: apache/superset:3.1.0
+    container_name: superset_bi
+    user: root  # Обязательно root, чтобы pip мог установить пакет
+    # ТОТ САМЫЙ РАБОЧИЙ ВАРИАНТ ИЗ ВАШЕГО ДИАЛОГА:
+    entrypoint: [ "/bin/sh", "-c", "pip install clickhouse-connect && /usr/bin/run-server.sh" ]
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: my_super_long_and_very_secure_random_string_12345!
+    networks:
+      - data_network
+
+  # --- ОБЪЕКТНОЕ ХРАНИЛИЩЕ MINIO (АНАЛОГ AWS S3) ---
+  minio:
+    image: minio/minio:latest
+    container_name: minio_storage
+    ports:
+      - "9005:9000"  # Порт для API (для ClickHouse и Airflow)
+      - "9001:9001"  # Порт для веб-интерфейса (для вас)
+    environment:
+      MINIO_ROOT_USER: minio_admin
+      MINIO_ROOT_PASSWORD: minio_strong_password
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - data_network
+
+# --- ТОМА И СЕТИ ---
+volumes:
+  clickhouse_data:
+    external: true 
+  postgres_data: 
+  minio_data:    
+
+networks:
+  data_network:
+    external: true
+    name: clickhouse_data_network  

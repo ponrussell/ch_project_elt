@@ -1,0 +1,167 @@
+version: 2
+
+sources:
+  - name: clickhouse_bronze
+    database: default
+    schema: bronze
+    description: "Бронзовый слой сырых данных веб-аналитики (Курс Ивана Натарова)"
+    tables:
+      - name: hits
+        description: "Сырые данные веб-аналитики (Бронзовый слой). Условия карантина описаны в модели stg_bronze_hits."
+
+  - name: clickhouse_silver
+    database: default
+    schema: silver
+    description: "Серебряный слой очищенных данных веб-аналитики"
+    tables:
+      - name: hits
+        description: "Очищенные данные после трансформаций таблицы бронзового слоя. Данные поступают через ClickHouse MV."
+
+models:
+  - name: stg__bronze_hits
+    description: |
+      Зеркальное представление Бронзового слоя для визуализации типов и связей.
+      
+      **Правила фильтрации (карантина) для слоя Silver / DQL:**
+      * `is_robot = 0` (только живые люди)
+      * `region_id != 0`
+      * `user_id != 0` и `watch_id != 0`
+      * `event_time > '1970-01-01'`
+      * `url != ''`
+      * `trafic_source_id` от -1 до 10
+      * `is_not_bounce` строго 0 или 1
+      * `param_price >= 0`
+      * Исключены фейковые заказы: `NOT (param_price > 0 AND (param_order_id = '' OR param_order_id = '0'))`
+      * Для мобильных заполнены телефон и модель: `(is_mobile = 1 AND mobile_phone != 0 AND mobile_phone_model != '') OR is_mobile = 0`
+      * Экран валидного размера: `resolution_width > 10 AND resolution_height > 10`
+    columns:
+      - name: event_date
+        description: "Дата события по UTC-0. Используется для партиционирования."
+      - name: event_time
+        description: "Дата и время события по UTC-0."
+      - name: watch_id
+        description: "Уникальный идентификатор конкретного просмотра страницы (хита)."
+      - name: user_id
+        description: "Уникальный идентификатор посетителя сайта."
+      - name: region_id
+        description: "Числовой идентификатор географического региона пользователя."
+      - name: os
+        description: "Внутренний числовой идентификатор операционной системы."
+      - name: user_agent
+        description: "Внутренний числовой идентификатор браузера."
+      - name: is_mobile
+        description: "Флаг типа устройства (1 — мобильное устройство, 0 — десктоп)."
+      - name: mobile_phone
+        description: "Числовой идентификатор производителя (бренда) мобильного телефона."
+      - name: mobile_phone_model
+        description: "Текстовое название модели устройства. Может содержать обрывки парсинга и пустые строки."
+      - name: resolution_width
+        description: "Разрешение экрана устройства в пикселях по ширине."
+      - name: resolution_height
+        description: "Разрешение экрана устройства в пикселях по высоте."
+      - name: is_robot
+        description: "Флаг антифрод-системы (0 — живой человек, 1-4 — типы роботов)."
+      - name: trafic_source_id
+        description: "Внутренний числовой код типа источника трафика (прямой заход, реклама и т.д.)."
+      - name: utm_source
+        description: "UTM-метка источника трафика. Может содержать пустые строки."
+      - name: utm_medium
+        description: "UTM-метка типа трафика."
+      - name: utm_campaign
+        description: "UTM-метка названия рекламной кампании."
+      - name: utm_content
+        description: "UTM-метка содержания объявления или дополнительной информации."
+      - name: utm_term
+        description: "UTM-метка ключевом слова или поисковой фразы из рекламы."
+      - name: referer
+        description: "Полный URL-адрес страницы, с которой пользователь перешел на текущую страницу."
+      - name: referer_domain
+        description: "Домен страницы источника перехода (выделен из Referer)."
+      - name: search_phrase
+        description: "Текст поискового запроса (если переход был из поисковой системы)."
+      - name: url
+        description: "Полный адрес просматриваемой страницы сайта."
+      - name: url_domain
+        description: "Домен сайта, на котором происходит просмотр."
+      - name: is_not_bounce
+        description: "Флаг «не-отказа» (1 — качественный визит, 0 — быстрый уход (отказ))."
+      - name: goals_reached
+        description: "Массив числовых идентификаторов целей, достигнутых в рамках хита. Например, пользователь добавил товар в корзину."
+      - name: param_order_id
+        description: "Номер оформленного заказа. Заполняется вместе с суммой при покупке."
+      - name: param_price
+        description: "Сумма заказа. Заполняется только в момент совершения покупки на этой странице."
+      - name: _ingestion_time
+        description: "Техническое маркер-время записи строки в таблицу ClickHouse."
+      - name: _source_system
+        description: "Источник данных (например, имя системы-поставщика или URL)."
+
+    # 2. ОПИСАНИЕ МОДЕЛИ СЕРЕБРА (ПЕРЕНЕСЛИ КОЛОНКИ СЮДА)
+  - name: stg__silver_hits
+    description: |
+      Зеркальное представление Серебряного слоя.
+      Данные очищены от роботов (`is_robot = 0`) и фейковых регионов.
+    columns:
+      - name: event_date
+        description: "Дата события по UTC-0."
+        tests:
+          - not_null # Тест: дата всегда должна быть заполнена
+      - name: event_time
+        description: "Дата и время события по UTC-0."
+      - name: watch_id
+        description: "Уникальный идентификатор просмотра страницы (хита)."
+        tests:
+          - unique   # Тест: проверка на отсутствие дубликатов
+          - not_null # Тест: ID просмотра не может быть пустым
+      - name: user_id
+        description: "Уникальный идентификатор посетителя сайта."
+      - name: region_id
+        description: "Числовой идентификатор географического региона пользователя."
+      - name: os
+        description: "Внутренний числовой идентификатор операционной системы."
+      - name: user_agent
+        description: "Внутренний числовой идентификатор браузера."
+      - name: is_mobile
+        description: "Флаг типа устройства (1 — мобильное устройство, 0 — десктоп)."
+      - name: mobile_phone
+        description: "Числовой идентификатор производителя мобильного телефона."
+      - name: mobile_phone_model
+        description: "Текстовое название модели устройства."
+      - name: resolution_width
+        description: "Разрешение экрана устройства в пикселях по ширине."
+      - name: resolution_height
+        description: "Разрешение экрана устройства в пикселях по высоте."
+      - name: trafic_source_id
+        description: "Внутренний числовой код типа источника трафика."
+      - name: utm_source
+        description: "UTM-метка источника трафика."
+      - name: utm_medium
+        description: "UTM-метка типа трафика."
+      - name: utm_campaign
+        description: "UTM-метка названия рекламной кампании."
+      - name: utm_content
+        description: "UTM-метка содержания объявления."
+      - name: utm_term
+        description: "UTM-метка ключевого слова."
+      - name: referer
+        description: "Полный URL-адрес страницы, с которой пользователь перешел."
+      - name: referer_domain
+        description: "Домен страницы источника перехода."
+      - name: search_phrase
+        description: "Текст поискового запроса."
+      - name: url
+        description: "Полный адрес просматриваемой страницы сайта."
+      - name: url_domain
+        description: "Домен сайта, на котором происходит просмотр."
+      - name: is_not_bounce
+        description: "Флаг «не-отказа»."
+      - name: goals_reached
+        description: "Массив числовых идентификаторов целей."
+      - name: param_order_id
+        description: "Номер оформленного заказа."
+      - name: param_price
+        description: "Сумма заказа."
+      - name: _processed_time
+        description: "Время трансформации и записи в базу серебряного слоя."
+      - name: _source_system
+        description: "Источник данных"

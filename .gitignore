@@ -1,0 +1,20 @@
+# Секреты dbt и системные файлы
+profiles.yml
+.env
+*.passwd
+
+# Локальные папки данных Docker (чтобы не забить гит гигабайтами логов и БД)
+airflow/logs/
+airflow/plugins/
+profiles.yml
+clickhouse-data/
+clickhouse_data/
+logs/
+target/
+postgres_data/
+minio_data/
+
+# Временные файлы систем
+.DS_Store
+__pycache__/
+*.pyc
