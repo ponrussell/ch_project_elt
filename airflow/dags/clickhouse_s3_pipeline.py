@@ -4,25 +4,64 @@ from airflow import DAG
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.operators.python import PythonOperator
+from airflow.utils.email import send_email
 
 # Настройки MinIO
 S3_CONN_ID = 'aws_boto3_s3'
 S3_BUCKET = 'bronze'
-S3_FILE_PATTERN = '*.parquet'  # <--- Сменили маску на Parquet
+S3_FILE_PATTERN = '*.parquet' 
 
 # Настройки ClickHouse
 CH_HOST = 'http://clickhouse-course1:8123'
 CH_USER = 'student'
 CH_PASSWORD = 'strongpassword'
-CH_TABLE = 'test.bronze'  # <--- Изменили имя целевой таблицы на вашу test.bronze
+CH_TABLE = 'test.bronze'  
 
+# 2. СОЗДАЛИ ФУНКЦИЮ АЛЕРТИНГА
+def alert_failed_task(context):
+    ti = context.get('task_instance')
+    task_id = ti.task_id
+    dag_id = ti.dag_id
+    execution_date = context.get('execution_date').strftime('%Y-%m-%d %H:%M:%S')
+    exception = context.get('exception') 
+    
+    try:
+        files = ti.xcom_pull(task_ids='load_s3_to_clickhouse')
+        target_file = files if files else "Не определен"
+    except Exception:
+        target_file = "Не определен"
+
+    subject = f"⚠️ ALERT: Сбой в таске {task_id} | DAG: {dag_id}"
+    
+    html_content = f"""
+    <div style="font-family: Arial, sans-serif; border: 1px solid #ffcccc; padding: 20px; background-color: #fff5f5;">
+        <h2 style="color: #cc0000; margin-top: 0;">💥 Произошла авария в пайплайне данных!</h2>
+        <p><b>Идентификатор DAG:</b> <code style="background: #eee; padding: 2px 5px;">{dag_id}</code></p>
+        <p><b>Сломался таск:</b> <code style="background: #eee; padding: 2px 5px;">{task_id}</code></p>
+        <p><b>Время запуска (UTC):</b> {execution_date}</p>
+        <hr style="border: 0; border-top: 1px solid #ffcccc;">
+        <p style="color: #660000; font-family: monospace; background: #ffe6e6; padding: 10px; border-left: 4px solid #cc0000;">
+            <b>Текст технической ошибки:</b><br>{exception}
+        </p>
+        <hr style="border: 0; border-top: 1px solid #ffcccc;">
+        <p style="font-size: 12px; color: #666;"><i>Уведомление сформировано автоматически платформой Apache Airflow. Файл сохранен в MinIO S3.</i></p>
+    </div>
+    """
+    
+    send_email(
+        to='xxxponrussellxxx@yandex.ru',  # <--- УКАЖИТЕ ЗДЕСЬ СВОЮ ЛИЧНУЮ ПОЧТУ ЯНДЕКС
+        subject=subject,
+        html_content=html_content
+    )
+
+# 3. ПРИВЯЗАЛИ АЛЕРТ К КОЛБЭКУ DAG
 default_args = {
     'owner': 'airflow',
     'start_date': datetime(2026, 1, 1),
     'retries': 1,
     'retry_delay': timedelta(minutes=1),
+    'on_failure_callback': alert_failed_task,  # <--- ЭТА СТРОКА ЗАПУСКАЕТ АЛЕРТ ПРИ ПАДЕНИИ
 }
-
 def load_from_s3_to_clickhouse(**kwargs):
     """
     Сканирует бакет MinIO, находит файлы Parquet и передает команду в ClickHouse

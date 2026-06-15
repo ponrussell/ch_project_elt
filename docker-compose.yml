@@ -4,6 +4,13 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://platform_admin:supersecretpassword@postgres:5432/airflow_metadata
     AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+    AIRFLOW__SMTP__SMTP_HOST: 'smtp.yandex.ru'
+    AIRFLOW__SMTP__SMTP_PORT: 465
+    AIRFLOW__SMTP__SMTP_USER: ${YANDEX_SMTP_USER}         # <--- Docker сам возьмет это из .env
+    AIRFLOW__SMTP__SMTP_PASSWORD: ${YANDEX_SMTP_PASSWORD}      # Специальный пароль приложения (не от аккаунта)
+    AIRFLOW__SMTP__SMTP_STARTTLS: 'False'
+    AIRFLOW__SMTP__SMTP_SSL: 'True'
+    AIRFLOW__SMTP__SMTP_MAIL_FROM: xxxponrussellxxx@yandex.ru   
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
