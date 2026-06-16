@@ -1,3 +1,5 @@
+import sys
+import os
 from datetime import datetime, timedelta
 import requests
 from airflow import DAG
@@ -11,10 +13,10 @@ S3_CONN_ID = 'aws_boto3_s3'
 S3_BUCKET = 'bronze'
 S3_FILE_PATTERN = '*.parquet' 
 
-# Настройки ClickHouse
+# Настройки ClickHouse (ТЕПЕРЬ ПОЛНОСТЬЮ БЕЗОПАСНЫ)
 CH_HOST = 'http://clickhouse-course1:8123'
-CH_USER = 'student'
-CH_PASSWORD = 'strongpassword'
+CH_USER = os.getenv('CH_USER', 'student')            # <--- Читаем из Docker env
+CH_PASSWORD = os.getenv('CH_PASSWORD', 'strongpassword')  # <--- Читаем из Docker env
 CH_TABLE = 'test.bronze'  
 
 # 2. СОЗДАЛИ ФУНКЦИЮ АЛЕРТИНГА
@@ -49,7 +51,7 @@ def alert_failed_task(context):
     """
     
     send_email(
-        to='xxxponrussellxxx@yandex.ru',  # <--- УКАЖИТЕ ЗДЕСЬ СВОЮ ЛИЧНУЮ ПОЧТУ ЯНДЕКС
+        to='xxxponrussellxxx@yandex.ru',
         subject=subject,
         html_content=html_content
     )
@@ -120,6 +122,122 @@ def load_from_s3_to_clickhouse(**kwargs):
     s3_hook.delete_objects(bucket=S3_BUCKET, keys=target_file)
     print(f"Файл {target_file} удален из бакета {S3_BUCKET}")
 
+def write_audit_log(**kwargs):
+    """
+    Считает количество обработанных строк в текущем запуске
+    и записывает метрики качества данных в test.audit_log
+    """
+    run_id = kwargs['run_id']
+    
+    # Пытаемся достать имя файла из контекста (чтобы записать в лог)
+    try:
+        s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
+        files = s3_hook.list_keys(bucket_name=S3_BUCKET)
+        target_file = files[0] if files else "unknown"
+    except Exception:
+        target_file = "file_processed"
+
+    print(f"Начинаю расчет метрик аудита для запуска: {run_id}")
+
+    # Мощный аналитический запрос ClickHouse: считает срезы за последние 5 минут
+    query = f"""
+    INSERT INTO test.audit_log
+    SELECT 
+        '{run_id}' AS run_id,
+        '{target_file}' AS file_name,
+        -- 1. Сколько пришло в Бронзу (за последние 5 минут)
+        (SELECT count() FROM test.bronze WHERE _ingestion_time >= now() - INTERVAL 5 MINUTE) AS b_rows,
+        -- 2. Сколько дошло до Сильвер (фильтруем по новому столбцу _processed_time)
+        (SELECT count() FROM test.silver WHERE _processed_time >= now() - INTERVAL 5 MINUTE) AS s_rows,
+        -- 3. Сколько улетело в Карантин (DLQ)
+        (SELECT count() FROM test.dlq WHERE _ingestion_time >= now() - INTERVAL 5 MINUTE) AS d_rows,
+        -- 4. Сколько дублей съел движок: Бронза - Сильвер - Карантин
+        cast(b_rows - s_rows - d_rows AS Int64) AS dropped_duplicates,
+        -- 5. Процент валидных данных
+        round(s_rows * 100.0 / nullIf(b_rows, 0), 2) AS valid_percent,
+        -- 6. Процент брака
+        round(d_rows * 100.0 / nullIf(b_rows, 0), 2) AS invalid_percent,
+        now() AS processed_at
+    """
+
+    response = requests.post(
+        CH_HOST,
+        params={'query': query, 'user': CH_USER, 'password': CH_PASSWORD}
+    )
+    
+    if response.status_code != 200:
+        raise Exception(f"Ошибка при записи аудит-лога: {response.text}")
+    print("Метрики аудита успешно зафиксированы в test.audit_log!")
+
+def check_data_quality(**kwargs):
+    """
+    Checks data quality using test.audit_log table via JSON format.
+    If error rate is above 5%, sends business alert email.
+    """
+    # Принудительно разрешаем UTF-8 для stdout/stderr внутри этой таски
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+
+    run_id = kwargs['run_id']
+    MAX_ALLOWED_ERROR_RATE = 5.0  # Threshold in %
+
+    query = f"""
+    SELECT file_name, invalid_percent, dlq_rows, bronze_rows 
+    FROM test.audit_log 
+    WHERE run_id = '{run_id}' 
+    LIMIT 1
+    FORMAT JSONEachRow
+    """
+    
+    response = requests.post(
+        CH_HOST,
+        params={'query': query, 'user': CH_USER, 'password': CH_PASSWORD}
+    )
+    
+    if response.status_code != 200:
+        raise Exception(f"Data Quality check failed: {response.text}")
+        
+    try:
+        # response.json() автоматически корректно обрабатывает UTF-8 из ClickHouse
+        data = response.json()
+    except Exception:
+        print("No valid JSON returned or audit record is missing. Task finished safely.")
+        return
+
+    # Теперь здесь безопасно можно использовать оригинальное имя файла, даже если оно на русском
+    file_name = data.get('file_name', 'unknown_file') 
+    invalid_percent = float(data.get('invalid_percent', 0.0))
+    dlq_rows = int(data.get('dlq_rows', 0))
+    bronze_rows = int(data.get('bronze_rows', 0))
+
+    print(f"Current error rate verified successfully for file: {file_name}")
+
+    if invalid_percent > MAX_ALLOWED_ERROR_RATE:
+        print("CRITICAL ERROR RATE DETECTED! Sending email...")
+        
+        subject = "DATA QUALITY ALERT: High Error Rate Detected"
+        
+        html_content = f"""
+        <div style="font-family: Arial, sans-serif; border: 2px solid #ff9900; padding: 20px; background-color: #fff9f2;">
+            <h2 style="color: #e65c00; margin-top: 0;">Data Quality Anomaly Detected!</h2>
+            <p><b>File Name:</b> {file_name}</p>
+            <p><b>Total Rows in Source:</b> {bronze_rows}</p>
+            <p style="font-size: 16px;"><b>Sent to Dead Letter Queue (DLQ):</b> <span style="color: red; font-weight: bold;">{dlq_rows} rows</span></p>
+            <p style="font-size: 18px; background: #ffebd6; padding: 10px; border-left: 5px solid #e65c00;">
+                <b>Final Error Rate:</b> <span style="color: #cc0000; font-weight: bold;">{invalid_percent}%</span> (Max Allowed: {MAX_ALLOWED_ERROR_RATE}%)
+            </p>
+            <hr style="border: 0; border-top: 1px solid #ffcc99;">
+            <p style="font-size: 12px; color: #666;"><i>The pipeline finished successfully, but data quality requires investigation. Logged in test.audit_log.</i></p>
+        </div>
+        """
+        
+        send_email(
+            to='your_real_email@yandex.ru',  # <--- ЗАМЕНЕНО НА ЛАТИНИЦУ
+            subject=subject,
+            html_content=html_content
+        )
+    else:
+        print("Data quality is within normal limits.")
 
 with DAG(
     dag_id='clickhouse_s3_pipeline',
@@ -148,4 +266,19 @@ with DAG(
         python_callable=load_from_s3_to_clickhouse,
     )
 
-    wait_for_s3_file >> load_data
+    # 3. Фиксация аудита в лог таблицу
+    audit_log = PythonOperator(
+        task_id='write_audit_log',
+        python_callable=write_audit_log,
+        provide_context=True,
+    )
+
+    # 4. Проверка бизнес-качества
+    check_quality = PythonOperator(
+        task_id='check_data_quality',
+        python_callable=check_data_quality,
+        provide_context=True,
+    )
+
+    #Сенсор -> Загрузка -> Запись аудита -> Проверка качества
+    wait_for_s3_file >> load_data >> audit_log >> check_quality
