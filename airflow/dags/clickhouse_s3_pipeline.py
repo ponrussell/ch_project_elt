@@ -125,34 +125,28 @@ def write_audit_log(**kwargs):
     и записывает метрики качества данных в test.audit_log
     """
     run_id = kwargs['run_id']
-    
-    # Пытаемся достать имя файла из контекста (чтобы записать в лог)
+    ti = kwargs['ti']
+
     try:
-        s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
-        files = s3_hook.list_keys(bucket_name=S3_BUCKET)
-        target_file = files[0] if files else "unknown"
+        target_file = ti.xcom_pull(task_ids='load_s3_to_clickhouse', key='processed_file_name')
+        if not target_file:
+            target_file = "file_processed"
     except Exception:
         target_file = "file_processed"
 
     print(f"Начинаю расчет метрик аудита для запуска: {run_id}")
 
-    # Мощный аналитический запрос ClickHouse: считает срезы за последние 5 минут
+    # Аналитический запрос ClickHouse
     query = f"""
     INSERT INTO test.audit_log
     SELECT 
         '{run_id}' AS run_id,
         '{target_file}' AS file_name,
-        -- 1. Сколько пришло в Бронзу (за последние 5 минут)
         (SELECT count() FROM test.bronze WHERE _ingestion_time >= now() - INTERVAL 5 MINUTE) AS b_rows,
-        -- 2. Сколько дошло до Сильвер (фильтруем по новому столбцу _processed_time)
         (SELECT count() FROM test.silver WHERE _processed_time >= now() - INTERVAL 5 MINUTE) AS s_rows,
-        -- 3. Сколько улетело в Карантин (DLQ)
         (SELECT count() FROM test.dlq WHERE _ingestion_time >= now() - INTERVAL 5 MINUTE) AS d_rows,
-        -- 4. Сколько дублей съел движок: Бронза - Сильвер - Карантин
         cast(b_rows - s_rows - d_rows AS Int64) AS dropped_duplicates,
-        -- 5. Процент валидных данных
         round(s_rows * 100.0 / nullIf(b_rows, 0), 2) AS valid_percent,
-        -- 6. Процент брака
         round(d_rows * 100.0 / nullIf(b_rows, 0), 2) AS invalid_percent,
         now() AS processed_at
     """
@@ -164,14 +158,14 @@ def write_audit_log(**kwargs):
     
     if response.status_code != 200:
         raise Exception(f"Ошибка при записи аудит-лога: {response.text}")
-    print("Метрики аудита успешно зафиксированы в test.audit_log!")
+    print("Метрики аудита успешно зафиксированы in test.audit_log!")
 
 def send_quality_alert(context):
     send_email(
-        to='xxxponrussellxxx@yandex.ru',
+        to=ALERT_EMAIL, 
         subject="DATA QUALITY ALERT: High Error Rate Detected",
-        html_content=None,  # Airflow умеет читать из шаблона
-        template='alert_template.html'  # Путь к файлу шаблона
+        html_content=None,  
+        template='alert_template.html'  
     )
 
 with DAG(
@@ -211,10 +205,9 @@ with DAG(
     # 4. Проверка бизнес-качества
     check_data_quality = ClickHouseOperator(
         task_id='check_data_quality',
-        clickhouse_conn_id='clickhouse_default',  # Настраивается в админке Airflow за 1 минуту
+        clickhouse_conn_id='clickhouse_default',  
         sql="""
             SELECT 
-                -- Если invalid_percent > 5, запрос упадет с ошибкой и текстом 'Too many errors!'
                 require(
                     invalid_percent <= 5.0, 
                     'Too many errors! Invalid percent is ' || cast(invalid_percent as String)
@@ -223,8 +216,8 @@ with DAG(
             WHERE run_id = '{{ run_id }}'
             LIMIT 1
         """,
-        on_failure_callback=send_quality_alert # Привязываем отправку почты к падению таски
+        on_failure_callback=send_quality_alert 
     )
 
-    #Сенсор -> Загрузка -> Запись аудита -> Проверка качества
+    # Сенсор -> Загрузка -> Запись аудита -> Проверка качества
     wait_for_s3_file >> load_data >> audit_log >> check_data_quality
