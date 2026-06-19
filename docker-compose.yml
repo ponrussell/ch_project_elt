@@ -23,6 +23,7 @@ x-airflow-common: &airflow-common
     - ./airflow/logs:/opt/airflow/logs
     - ./for_load:/opt/airflow/data
     - .:/opt/airflow/dbt_project
+    - ${AIRFLOW_PROJ_DIR:-.}/requirements-local.txt:/requirements.txt
   networks:
     - data_network
 
@@ -91,6 +92,7 @@ services:
   airflow-webserver:
     <<: *airflow-common
     container_name: airflow_webserver
+    # Возвращаем стандартную быструю команду Airflow
     command: webserver
     ports:
       - "8080:8080"
@@ -98,26 +100,30 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # Добавляем стандартную сеть bridge для доступа в интернет
     networks:
       - data_network
+      - default
 
   airflow-scheduler:
     <<: *airflow-common
     container_name: airflow_scheduler
+    # Возвращаем стандартную быструю команду Airflow
     command: scheduler
     restart: always
     depends_on:
       postgres:
         condition: service_healthy
+    # Добавляем стандартную сеть bridge для доступа в интернет
     networks:
       - data_network
+      - default
 
-  # --- БИЗНЕС-АНАЛИТИКА SUPERSET (ТОТ САМЫЙ РАБОЧИЙ ВАРИАНТ) ---
+  # --- БИЗНЕС-АНАЛИТИКА SUPERSET ---
   superset:
     image: apache/superset:3.1.0
     container_name: superset_bi
-    user: root  # Обязательно root, чтобы pip мог установить пакет
-    # ТОТ САМЫЙ РАБОЧИЙ ВАРИАНТ ИЗ ВАШЕГО ДИАЛОГА:
+    user: root  
     entrypoint: [ "/bin/sh", "-c", "pip install clickhouse-connect && /usr/bin/run-server.sh" ]
     ports:
       - "8088:8088"
@@ -131,8 +137,8 @@ services:
     image: minio/minio:latest
     container_name: minio_storage
     ports:
-      - "9005:9000"  # Порт для API (для ClickHouse и Airflow)
-      - "9001:9001"  # Порт для веб-интерфейса (для вас)
+      - "9005:9000"  
+      - "9001:9001"  
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
@@ -152,4 +158,4 @@ volumes:
 networks:
   data_network:
     external: true
-    name: clickhouse_data_network  
+    name: clickhouse_data_network
